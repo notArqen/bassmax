@@ -714,6 +714,46 @@ addEventListener('paste',e=>{
   else{const err=$('#err');err.hidden=false;err.textContent=`pasted file "${files[0].name}" isn't audio or video`}
 });
 
+// Safari / iOS WebKit's decodeAudioData can't open QuickTime (.mov) files, i.e. every iPhone camera clip
+// ("EncodingError: Decoding failed"). only when it refuses: demux the audio track with mediabunny and decode
+// it with WebCodecs instead, placed by timestamp so it stays in sync with the video, resampled to the context rate.
+async function decodeContainerAudio(file,ctx){
+  if(typeof AudioDecoder!=='function')throw new Error('no WebCodecs AudioDecoder');
+  const input=new MB.Input({source:new MB.BlobSource(file),formats:[MB.MP4,MB.QTFF]});
+  const at=await input.getPrimaryAudioTrack();
+  if(!at)throw new Error('no audio track found');
+  const cfg=await at.getDecoderConfig(),dur=await at.computeDuration();
+  const sr=cfg.sampleRate,ch=cfg.numberOfChannels,len=Math.max(1,Math.round(dur*sr));
+  const data=Array.from({length:ch},()=>new Float32Array(len));
+  let fail=null;
+  const put=d=>{
+    try{
+      const n=d.numberOfFrames,at0=Math.round(d.timestamp/1e6*sr),tmp=new Float32Array(n);
+      for(let c=0;c<ch;c++){
+        d.copyTo(tmp,{planeIndex:Math.min(c,d.numberOfChannels-1),format:'f32-planar'});
+        const from=Math.max(0,-at0),to=Math.min(n,len-at0);   // drop encoder priming before 0 and anything past the end
+        if(to>from)data[c].set(tmp.subarray(from,to),at0+from);
+      }
+    }catch(e){fail=fail||e}
+    d.close();
+  };
+  const dec=new AudioDecoder({output:put,error:e=>{fail=fail||e}});
+  dec.configure(cfg);
+  for await(const p of new MB.EncodedPacketSink(at).packets()){
+    if(fail)break;
+    dec.decode(p.toEncodedAudioChunk());
+    if(dec.decodeQueueSize>64)await new Promise(r=>dec.addEventListener('dequeue',r,{once:true}));
+  }
+  if(!fail)await dec.flush();
+  if(dec.state!=='closed')dec.close();
+  if(fail)throw fail;
+  const raw=new AudioBuffer({numberOfChannels:ch,length:len,sampleRate:sr});
+  data.forEach((d,c)=>raw.copyToChannel(d,c));
+  if(sr===ctx.sampleRate)return raw;
+  const o=new OfflineAudioContext(ch,Math.round(len*ctx.sampleRate/sr),ctx.sampleRate);
+  const src=new AudioBufferSourceNode(o,{buffer:raw});src.connect(o.destination);src.start();
+  return o.startRendering();
+}
 async function loadFile(file){
   const err=$('#err');err.hidden=true;
   try{
@@ -722,7 +762,9 @@ async function loadFile(file){
       S.live=buildGraph(S.ctx,an,P)}
     stop();
     const ab=await file.arrayBuffer();
-    const buf=await S.ctx.decodeAudioData(ab);
+    let buf;
+    try{buf=await S.ctx.decodeAudioData(ab)}
+    catch(e){buf=await decodeContainerAudio(file,S.ctx).catch(e2=>{console.warn('webcodecs fallback failed',e2);throw e})}
     if(S.url)URL.revokeObjectURL(S.url);
     S.url=URL.createObjectURL(file);
     S.file=file;S.isVideo=/^video\//.test(file.type)||/\.(mov|mp4|m4v)$/i.test(file.name);
